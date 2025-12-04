@@ -251,6 +251,8 @@ loss_pg  = max(loss_pg1, loss_pg2)
 ```
 
 **5_trl.py**
+
+
 用 Hugging Face 的 trl 库来做 PPO
 1.准备 tokenizer和数据
 tokenizer 同样是 Pythia 的，这里把 max_length=5，只取短 prompt 用来问问题。
@@ -311,9 +313,52 @@ trainer = PPOTrainer(
     eval_dataset=dataset['test'],
 )
 ```
-5.结果
+由于设置为20 万 episode，训练量十分大，耗时近15h
+![示例图片](./result/trl_time.png)
 
 **4_test.py**
-加载训练好的 PPO/TRL 模型，随机问几个 IMDB 句子，看模型怎么续写
+加载训练好的PPO/TRL模型，随机问几个 IMDB 句子，看模型怎么续写
+首先看手动ppo结果
+![示例图片](./result/ppo_output.png)
+为了拿高分，它学会了最保险、最稳的模式：“狂吹一通电影”，所以看到的几乎所有输出都是“最好、最喜欢、强烈推荐”。
+再看看trl结果
+![示例图片](./result/trl_output.png)
+模型变成了只会输出”movie“的复读机，尝试加载中途 checkpoint 看看是否没塌得那么严重
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ckpt_path = "model/ppo_trl/checkpoint-500"  
+
+tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+model_actor = AutoModelForCausalLM.from_pretrained(ckpt_path).to(device)
+```
+尝试在4_test.py中修改这几句代码，结果还是未发生变化，证明TRL的PPO一上来就把策略往“movie 复读机”这个坑里推了，塌缩发生得非常早。
+分析是reward 只看“这是影评 + 有点正面”，没惩罚重复、没考虑信息量，模型就学会了最简单的做法：高频词 + 看起来像影评。
+
+对原有trl.py做出修改
+```python
+answers = model_actor.generate(
+    input_ids=question,
+    max_new_tokens=50,
+    do_sample=True,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=50,
+    repetition_penalty=1.2,   # 这个能抑制一部分复读
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
+```
+```python
+total_episodes=5000,
+```
+把总episode 数从200000大幅降到5000，防止策略掰到完全变形
+![示例图片](./result/trl_fix_output.png)
+可以看出比之前只会复读movie的结果要好很多
+
+回到幽默生成这一任务，经过IMDB 影评续写实验，受到很大启发：
+1.只优化一个维度（正向情感），PPO 很容易找到一个“全局高分模板”并疯狂复用，映射到幽默生成的话，我应该将幽默的 reward 至少拆成几块**相关性**：生成内容跟新闻标题 / 两个词的语义相似度（比如用句向量余弦相似度）。**幽默度**：专门的 “有趣 / 无趣” 分类器或打分器。**多样性**：n-gram 重复惩罚、长度、用词多样度等。幽默 RLHF 绝不能只用一个「好笑分」，必须是多目标综合 reward
+
+
 
 
