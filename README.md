@@ -1,6 +1,6 @@
 # Semeval2026-Task1-Humor_Generation
 
-## task A 
+## task A：多语言幽默生成
 
 ### 任务描述
 对于给定的中文、英文、西班牙语的新闻或者两个特定词汇组合生成一个笑话
@@ -14,11 +14,10 @@
 | **Subtotal** |      | **3,400** |
 | **Total**    |      | **3,400** |
 
-### 尝试调用大模型api来生成初版笑话
-调用qwen3-max生成初版笑话
+## 一、使用 Qwen3-Max 生成初版笑话
 
-
-**读取原始 TSV 文件**
+### 1. 读取原始 TSV
+三种语言的数据存放在 `task-a-zh.tsv / task-a-en.tsv / task-a-es.tsv` 中，每条样本包含：`id, word1, word2, headline` 等字段。
 ```python
 def load_all_data():
     # 如果脚本和 tsv 在同一目录，直接用文件名即可
@@ -35,7 +34,7 @@ def load_all_data():
     print(df_all.head())
     return df_all
 ```
-**构造多语言prompt**
+### 2.构造多语言prompt
 ```python
 def build_messages(lang, headline, word1, word2):
     """根据语言，构造 system + user 消息列表"""
@@ -121,7 +120,7 @@ def build_messages(lang, headline, word1, word2):
         {"role": "user", "content": user},
     ]
 ```
-**生成幽默**
+### 3.调用 Qwen3-Max 生成笑话
 ```python
 def gen_joke(messages):
     resp = client.chat.completions.create(
@@ -134,42 +133,48 @@ def gen_joke(messages):
     )
     return resp.choices[0].message.content.strip()
 ```
-### 结果
-使用qwen3-max生成的3400条部分结果如下：
-![示例图片](./result/zh_humor.png)
-![示例图片](./result/en_humor.png)
-![示例图片](./result/es_humor.png)
-### PPO
-由于大模型zero-shot的生成的笑话效果并不好，考虑使用PPO提升大模型生成笑话的能力，以imdb影评续写为例，描述PPO具体过程。
+### 4. 生成结果示意
+使用 Qwen3-Max 共生成约 3,400 条 多语言幽默文本，以下为部分可视化示例：
+---
+- 中文示例：
+  
+  ![示例图片](./result/zh_humor.png)
+- 英文示例：
+  ![示例图片](./result/en_humor.png)
+- 西班牙语示例：
+ ![示例图片](./result/es_humor.png)
+
+---
+
+## 二、IMDB 影评续写上的 PPO 实验
+由于单纯依赖大模型 zero-shot 生成的笑话质量并不稳定，后续计划使用 PPO（Proximal Policy Optimization） 对小模型进行 RLHF 风格的微调，以提升幽默生成质量。
+在真正上幽默任务之前，先在 IMDB 影评续写 上做了一个完整的 PPO 实验，用来熟悉整条 RLHF 流程，并观察常见“翻车模式”。
 
 
-**1_actor.py**
+### 1. 1_actor.py — 训练影评续写 Actor
+- 底模：EleutherAI/pythia-160m
+- 目标：在 IMDB 上做纯语言建模，得到一个会续写影评的 Causal LM。
 
+#### 核心步骤：
 
-拿 Pythia-160M 当底座，在 IMDB 影评上做纯语言建模，得到一个会续写影评的语言模型 actor。
-
-
-**具体步骤**
-
-
-1.环境和 tokenizer
+#### （1）环境和 tokenizer
 ```python
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 tokenizer = AutoTokenizer.from_pretrained('EleutherAI/pythia-160m')
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 ```
-2.加载 IMDB 数据，拼训练集和测试集，并只保留 text
+#### （2）加载 IMDB 数据，拼训练集和测试集，并只保留 text
 ```python
 dataset = load_dataset('imdb')
 dataset = concatenate_datasets(list((dataset.values())))
 dataset = dataset.remove_columns(['label'])
 ```
-3.加载一个 Causal LM 模型，当 actor
+#### （3）加载一个 Causal LM 模型，当 actor
 ```python
 model_actor = AutoModelForCausalLM.from_pretrained('EleutherAI/pythia-160m').to(device)
 optimizer = torch.optim.Adam(model_actor.parameters(), lr=1e-5)
 ```
-4.训练循环：标准 SFT
+#### （4）训练循环：标准 SFT
 ```python
 for epoch in range(10):
     for i, data in enumerate(loader):
@@ -180,32 +185,31 @@ for epoch in range(10):
 ```
 
 
-**2_critic.py**
+### 2. 2_critic.py — 训练情感 Critic / Reward Model
+- 仍然使用 Pythia-160M 作为底模。
+- 将 IMDB 的 label 作为情感标注，训练一个 0/1 情感打分模型，用于给续写结果打 reward。
+
+#### 核心步骤
 
 
-用同一个 Pythia-160M 底座，训练一个“给影评打好/坏分”的分类模型，当成 critic / reward model。
-
-**具体步骤**
-
-
-1.环境和 tokenizer
+#### （1）环境和 tokenizer
 ```python
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 tokenizer = AutoTokenizer.from_pretrained('EleutherAI/pythia-160m')
 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 ```
-2.加载 IMDB 数据，拼训练集和测试集，并保留label
+#### （2）加载 IMDB 数据，拼训练集和测试集，并保留label
 ```python
 dataset = load_dataset('imdb')
 dataset = concatenate_datasets([dataset[i] for i in ['train', 'test']])
 ```
-3.训练一个情感评分0/1（负面/正面）模型
+#### （3）训练一个情感评分0/1（负面/正面）模型
 ```python
 model_critic = AutoModelForSequenceClassification.from_pretrained(
     'EleutherAI/pythia-160m', num_labels=1).to(device)
 model_critic.config.pad_token_id = tokenizer.pad_token_id
 ```
-4.训练循环：标准 SFT
+#### （4）训练循环：标准 SFT
 ```python
 for epoch in range(10):
     for i, data in enumerate(loader):
@@ -216,16 +220,17 @@ for epoch in range(10):
 ```
 
 
-**3_ppo.py**
+### 3. 3_ppo.py — 手写 PPO 算法
 
-1.准备 tokenizer和数据
+#### （1）准备 tokenizer和数据
+
 tokenizer 同样是 Pythia 的，这里把 max_length=5，只取短 prompt 用来问问题。
 ```python
 def collator(data):
     data = [i['text'] for i in data]
     return tokenizer(data, padding=True, truncation=True, max_length=5, return_tensors='pt').input_ids.to(device)
 ```
-2.加载四个模型：actor / actor_ref / critic / critic_ref
+#### （2）加载四个模型：actor / actor_ref / critic / critic_ref
 ```python
 model_actor     = AutoModelForCausalLM.from_pretrained('model/actor')
 model_actor_ref = AutoModelForCausalLM.from_pretrained('model/actor')
@@ -235,7 +240,7 @@ model_critic_ref = AutoModelForSequenceClassification.from_pretrained('model/cri
 ```
 actor_ref、critic_ref 是旧策略/旧价值的冻结参照，用来算 KL、算 reward，真实更新的是 model_actor 和 model_critic。
 
-3. PPO 更新
+#### （3）PPO 目标函数
 用 KL + reward + advantage + clipped ratio，手动实现了 PPO 更新。
 对 value 部分做 clip
 ```python
@@ -250,11 +255,10 @@ loss_pg2 = -advantage * clamp(ratio, 0.8, 1.2)
 loss_pg  = max(loss_pg1, loss_pg2)
 ```
 
-**5_trl.py**
-
+### 4. 使用 TRL 重写 PPO：5_trl.py
 
 用 Hugging Face 的 trl 库来做 PPO
-1.准备 tokenizer和数据
+#### （1）准备 tokenizer和数据
 tokenizer 同样是 Pythia 的，这里把 max_length=5，只取短 prompt 用来问问题。
 ```python
 f = lambda data: {
@@ -263,7 +267,7 @@ f = lambda data: {
 dataset = dataset.map(f, remove_columns=dataset.column_names)
 dataset = dataset.train_test_split(test_size=2000)
 ```
-2.加载四个模型：actor / actor_ref / critic / critic_ref
+#### （2）加载四个模型：actor / actor_ref / critic / critic_ref
 ```python
 model_actor     = AutoModelForCausalLM.from_pretrained('model/actor')
 model_actor_ref = AutoModelForCausalLM.from_pretrained('model/actor')
@@ -273,7 +277,7 @@ model_critic_ref = AutoModelForSequenceClassification.from_pretrained('model/cri
 
 ```
 actor_ref、critic_ref 是旧策略/旧价值的冻结参照，用来算 KL、算 reward，真实更新的是 model_actor 和 model_critic。
-3.配置PPOConfig
+#### （3）配置PPOConfig
 ```python
 config = PPOv2Config(
     output_dir='output_dir',
@@ -286,7 +290,7 @@ config = PPOv2Config(
     save_strategy='no',
 )
 ```
-由于老的 PPOv2 API已经不适用于现在最新版本的trl，遂将代码改成如下：
+最初的代码使用了较老的 PPOv2Trainer 接口，已不兼容最新版本的 trl。因此改为使用当前版本提供的 PPOConfig + PPOTrainer。
 ```python
 ppo_config = PPOConfig(
     output_dir="model/ppo_trl",         # 保存目录
@@ -300,7 +304,7 @@ ppo_config = PPOConfig(
     total_episodes=20_0000,
 )
 ```
-4.创建 PPOv2Trainer
+#### （4）使用 PPOTrainer 进行训练：
 ```python
 trainer = PPOTrainer(
     args=ppo_config,
@@ -313,17 +317,28 @@ trainer = PPOTrainer(
     eval_dataset=dataset['test'],
 )
 ```
-由于设置为20 万 episode，训练量十分大，耗时近15h
+20 万 episode 的训练耗时接近**15** 小时（单卡），如下图所示：
 ![示例图片](./result/trl_time.png)
 
-**4_test.py**
-加载训练好的PPO/TRL模型，随机问几个 IMDB 句子，看模型怎么续写
-首先看手动ppo结果
+### 5.测试 PPO / TRL 模型：4_test.py
+
+4_test.py 用于加载 PPO / TRL 训练后的模型，对随机选取的 IMDB 句子进行续写，直观查看风格变化。
+#### （1）手写 PPO 的现象
+手写 PPO 的模型基本学会了一个“万能影评模板”：
+- “This is the best movie I've ever seen. I love this movie. I would recommend it to everyone.”
+
+无论 prompt 是什么，模型都倾向于给出 极度正向、类似句式 的好评段落——典型的「高分模板」模式崩塌。
+生成示意:
 ![示例图片](./result/ppo_output.png)
-为了拿高分，它学会了最保险、最稳的模式：“狂吹一通电影”，所以看到的几乎所有输出都是“最好、最喜欢、强烈推荐”。
-再看看trl结果
+
+#### （2） TRL 版本的初始问题：变成 “movie 复读机”
+在使用 TRL 版本的 PPO 时，如果不加任何限制，最终模型几乎退化成：
+- movie. movie movie movie movie movie ...
+
+不论前缀如何，都重复输出高频词 “movie”。
+生成示意：
 ![示例图片](./result/trl_output.png)
-模型变成了只会输出”movie“的复读机，尝试加载中途 checkpoint 看看是否没塌得那么严重
+尝试加载中间 checkpoint：
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -332,10 +347,10 @@ ckpt_path = "model/ppo_trl/checkpoint-500"
 tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
 model_actor = AutoModelForCausalLM.from_pretrained(ckpt_path).to(device)
 ```
-尝试在4_test.py中修改这几句代码，结果还是未发生变化，证明TRL的PPO一上来就把策略往“movie 复读机”这个坑里推了，塌缩发生得非常早。
+发现 500 step 附近已经出现了明显的塑性塌缩，说明 策略非常早就被 reward 推向“高频复读”的极端。
 分析是reward 只看“这是影评 + 有点正面”，没惩罚重复、没考虑信息量，模型就学会了最简单的做法：高频词 + 看起来像影评。
-
-对原有trl.py做出修改
+#### （3）修复：解码约束 + 减少 episode
+对 trl 推理阶段加入防复读约束：
 ```python
 answers = model_actor.generate(
     input_ids=question,
@@ -349,16 +364,24 @@ answers = model_actor.generate(
     pad_token_id=tokenizer.pad_token_id,
 )
 ```
+同时，将 total_episodes 从 200_000 大幅降低到 5_000：
 ```python
 total_episodes=5000,
 ```
-把总episode 数从200000大幅降到5000，防止策略掰到完全变形
+修复后的 TRL 结果明显好于“movie 复读机”，虽然仍带有一定模板化，但句子至少具备基本信息量和连贯性
+生成示意：
 ![示例图片](./result/trl_fix_output.png)
-可以看出比之前只会复读movie的结果要好很多
 
-回到幽默生成这一任务，经过IMDB 影评续写实验，受到很大启发：
-1.只优化一个维度（正向情感），PPO 很容易找到一个“全局高分模板”并疯狂复用，映射到幽默生成的话，我应该将幽默的 reward 至少拆成几块**相关性**：生成内容跟新闻标题 / 两个词的语义相似度（比如用句向量余弦相似度）。**幽默度**：专门的 “有趣 / 无趣” 分类器或打分器。**多样性**：n-gram 重复惩罚、长度、用词多样度等。幽默 RLHF 绝不能只用一个「好笑分」，必须是多目标综合 reward
-
+### 6.从 IMDB PPO 实验得到的经验，对幽默生成的启发
+IMDB 实验主要给了以下几点可直接迁移到幽默任务中的教训：
+#### （1）单一 Reward 极易造成模板化和模式塌缩
+- 在影评任务中，只优化“正向情感”这一维，PPO 很快收敛到「狂吹电影」模板。
+- 对应到幽默生成，如果只用一个“幽默得分”作为 reward，模型也很可能学出一两个固定笑点结构并疯狂复用。
+#### （2）幽默 Reward 需要拆分为多维综合指标
+后续设计中，计划至少包含：
+- **相关性**：生成文本与新闻标题 / 词组的语义相似度（如句向量余弦）；
+- **幽默度**：专门训练的“有趣 / 不有趣”分类器或打分模型；
+- **多样性**：n-gram 重复惩罚、长度正则、词汇多样度等。
 
 
 
