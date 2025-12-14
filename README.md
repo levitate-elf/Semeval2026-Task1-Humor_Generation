@@ -462,3 +462,126 @@ IMDB 实验主要给了以下几点可直接迁移到幽默任务中的教训：
 #### （3）sft部分结果如图所示
 
 ![示例图片](./result/v13_output.png)
+
+
+### 6.构造混合奖励模型
+为了在 PPO 阶段有效指导模型优化，同时避免“幽默感”的主观性导致模型跑偏，设计了一套 “模型打分 + 规则约束” 的混合奖励系统。
+
+#### （1）训练数据构造：基于阶梯的 Pairwise Ranking
+不需要额外的人工标注，而是直接利用 V13 数据集的天然质量阶梯 **(Data Tiers)** 来自动构建 **(Chosen, Rejected)** 偏好对：
+| Pair 类型 | Chosen (胜者) | Rejected (败者) | 学习目标 |
+| :--- | :--- | :--- | :--- |
+| **风格对齐** | **Human (Tier 0)** | V2 Synthetic (Tier 1) | 学习人类特有的“言外之意”和“幽默张力” |
+| **逻辑优化** | **V2 Synthetic (Tier 1)** | V12 Auto (Tier 2) | 学习更严谨的叙事结构，拒绝流水账 |
+| **硬约束注入** | **V12 Auto (Tier 2)** | **构造负样本 (Tier 3)** | 学习必须包含关键词 (通过随机剔除关键词构造负样本) |
+
+#### (2) 模型选型：mDeBERTa-v3
+相比于 Decoder-only 的生成模型，我们选择 **Encoder-only** 架构作为 Reward Model 的基座：
+* **模型**：`microsoft/mdeberta-v3-base` (多语言版)
+* **优势**：双向注意力机制（Bidirectional Attention）能更好地理解 Prompt 与 Joke 之间的上下文逻辑关联，且在 PPO 采样阶段推理速度更快。
+```python
+import os
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from trl import RewardTrainer, RewardConfig
+from datasets import load_from_disk
+
+# =================配置=================
+# 必须用 mDeBERTa (Multilingual)
+MODEL_NAME = "microsoft/mdeberta-v3-base" 
+OUTPUT_DIR = "model/humor_reward_model_v1"
+DATA_PATH = "data/reward_data_v13"
+# =====================================
+
+def train_rm():
+    print(f"🚀 Loading Model: {MODEL_NAME}")
+    
+    # 1. 加载 Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    # 2. 加载模型
+    # num_labels=1 表示输出一个标量分数
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, 
+        num_labels=1,
+        problem_type="regression", # 内部视为回归，但在 RewardTrainer 里是用 ranking loss
+        trust_remote_code=True
+    )
+    
+    # 3. 加载数据
+    dataset = load_from_disk(DATA_PATH)
+    
+    # 4. 数据预处理函数
+    # TRL 的 RewardTrainer 会自动处理 chosen/rejected 的 tokenize
+    # 我们只需要告诉它把 prompt 和 response 拼起来
+    def preprocess_function(examples):
+        new_examples = {
+            "input_ids_chosen": [],
+            "attention_mask_chosen": [],
+            "input_ids_rejected": [],
+            "attention_mask_rejected": [],
+        }
+        for prompt, chosen, rejected in zip(examples["prompt"], examples["chosen"], examples["rejected"]):
+            # 构造 DeBERTa 输入: [CLS] Prompt [SEP] Response [SEP]
+            tokenized_chosen = tokenizer(prompt, chosen, truncation=True, max_length=512)
+            tokenized_rejected = tokenizer(prompt, rejected, truncation=True, max_length=512)
+            
+            new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
+            new_examples["attention_mask_chosen"].append(tokenized_chosen["attention_mask"])
+            new_examples["input_ids_rejected"].append(tokenized_rejected["input_ids"])
+            new_examples["attention_mask_rejected"].append(tokenized_rejected["attention_mask"])
+            
+        return new_examples
+
+    print("🔄 Tokenizing data...")
+    tokenized_ds = dataset.map(preprocess_function, batched=True, remove_columns=dataset["train"].column_names)
+
+    # 5. 训练参数
+    training_args = RewardConfig(
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=8, # DeBERTa base 很小，显存够可以开大
+        gradient_accumulation_steps=4,
+        num_train_epochs=2,            # RM 很容易过拟合，1-2 epoch 足够
+        learning_rate=2e-5,            # Encoder 模型通常可以用大一点的 LR
+        fp16=True,                     # 开启混合精度
+        logging_steps=50,
+        eval_strategy="steps",
+        eval_steps=200,
+        save_strategy="steps",
+        save_steps=200,
+        max_length=512,
+        report_to="tensorboard",
+        remove_unused_columns=False,
+    )
+
+    # 6. Trainer
+    trainer = RewardTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=tokenized_ds["train"],
+        eval_dataset=tokenized_ds["test"],
+    )
+
+    print("🔥 Start Training Reward Model...")
+    trainer.train()
+    
+    trainer.save_model(OUTPUT_DIR)
+    print(f"✅ Reward Model Saved to {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    train_rm()
+```
+
+#### (3) 混合奖励公式 (The Hybrid Reward Function)
+在 PPO 过程中，最终的 Reward 不仅仅依赖神经网络的打分，而是三个维度的加权和：
+
+$$R_{total} = R_{quality} + R_{rule} + R_{relevance}$$
+* **$R_{quality}$ (神经网络打分)**：
+    由 mDeBERTa 给出。衡量文本的流畅度、幽默感和风格契合度。
+* **$R_{rule}$ (规则硬约束)**：
+    针对英文/西班牙文容易出现的“关键词幻觉”问题。通过 Regex 强制检测：
+    * **Missed Keywords Penalty**：若未包含指定关键词，直接给予重罚（如 `-5.0`）。
+    * **Repetition Penalty**：若检测到复读机模式（如重复单词），给予惩罚。
+* **$R_{relevance}$ (语义相关性)**：
+    使用轻量级 Embedding 模型计算 `CosineSimilarity(Headline, Joke)`。防止模型为了幽默而完全脱离新闻主题（跑题）。
